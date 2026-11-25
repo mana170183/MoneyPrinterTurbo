@@ -1,0 +1,55 @@
+# Weavl: build the API image from this fork and prove it renders a narrated, captioned video inside a 2 CPU / 4 GB limit.
+name: Weavl smoke test
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build --build-arg DOCKER_BUILD_MIRROR=default --build-arg PIP_USE_OFFICIAL=1 -t mpt:test .
+      - name: Render a test video through the API
+        run: |
+          set -eu
+          mkdir -p run/storage/local_videos
+          cp config.example.toml run/config.toml
+          sed -i 's/^api_key = ""/api_key = "ci-test-key"/; s/^log_level = "DEBUG"/log_level = "INFO"/' run/config.toml
+          for c in red blue green; do
+            ffmpeg -y -loglevel error -f lavfi -i "color=$c:size=1080x1920:rate=25:duration=6" -vf drawgrid=w=100:h=100:t=2:c=white run/storage/local_videos/$c.mp4 2>/dev/null || \
+            docker run --rm -v "$PWD/run/storage/local_videos:/o" --entrypoint ffmpeg mpt:test -y -loglevel error -f lavfi -i "color=$c:size=1080x1920:rate=25:duration=6" /o/$c.mp4
+          done
+          sudo chmod -R 777 run
+          docker run -d --name mpt --memory 4g --cpus 2 -p 8080:8080 -v "$PWD/run/config.toml:/MoneyPrinterTurbo/config.toml" \
+            -v "$PWD/run/storage:/MoneyPrinterTurbo/storage" mpt:test python main.py
+          for i in $(seq 1 30); do curl -fs -o /dev/null -H 'x-api-key: ci-test-key' localhost:8080/api/v1/tasks && break; sleep 2; done
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/tasks)" = 401   # the key is required
+          ID=$(curl -fsS -H 'x-api-key: ci-test-key' -H 'Content-Type: application/json' localhost:8080/api/v1/videos -d '{
+            "video_subject": "Home cooked meals near you",
+            "video_script": "Hungry for real home cooking? Homeal connects you with local home cooks. Pick a dish you love, order in minutes, and enjoy a meal made with care. Find your next favourite at homeal dot uk.",
+            "video_terms": ["home cooking", "family dinner", "fresh vegetables"],
+            "video_aspect": "9:16", "video_source": "local",
+            "video_materials": [{"provider": "local", "url": "red.mp4"}, {"provider": "local", "url": "blue.mp4"}, {"provider": "local", "url": "green.mp4"}],
+            "voice_name": "en-GB-SoniaNeural-Female", "bgm_type": "", "font_name": "BeVietnamPro-Bold.ttf", "subtitle_enabled": true, "n_threads": 2
+          }' | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["task_id"])')
+          echo "task $ID"
+          for i in $(seq 1 120); do
+            R=$(curl -fsS -H 'x-api-key: ci-test-key' localhost:8080/api/v1/tasks/$ID)
+            S=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"].get("state"))')
+            [ "$S" = 1 ] && break; [ "$S" = -1 ] && { echo "$R"; docker logs mpt | tail -60; exit 1; }
+            sleep 5
+          done
+          echo "$R"
+          V=$(echo "$R" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["videos"][0])')
+          P=$(python3 -c 'import sys,urllib.parse as u; print(u.urlsplit(sys.argv[1]).path)' "$V")
+          curl -fsS -H 'x-api-key: ci-test-key' -o out.mp4 "localhost:8080$P"
+          docker run --rm -v "$PWD:/w" --entrypoint ffprobe mpt:test -v error -show_entries stream=codec_type,width,height:format=duration -of compact /w/out.mp4
+          docker stats --no-stream mpt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: smoke-video, path: out.mp4, if-no-files-found: ignore }
